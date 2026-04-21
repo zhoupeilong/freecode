@@ -1,0 +1,83 @@
+{
+  "_schema_version": "1.0",
+  "_description": "ETL血缘映射配置：DM字段→参数→{JOIN链, DW字段, STG字段}，用于参数驱动SQL结构重建",
+
+  "dm_field_lineage": {
+    "DM_CTRC_XTCPLXRXXZBB.XMJLHXMFZRGH": {
+      "source_etl": "DM_CTRC_XTCPLXRXXZBB_中信登指标清洗.sql",
+      "params": {
+        "CTRC_XMJLHXMFZRQSLJ": {
+          "controls": "join_path",
+          "description": "控制DW表的JOIN方式：=1走trust_manager(T2), =2走trust_manager+B+C(T4)",
+          "values": {
+            "1": {
+              "dw_table": "DW_D_COMPANY_EMP_INFO",
+              "dw_alias_in_etl": "T2",
+              "join_condition": "ON INSTR(CONCAT(CONCAT(',', T.TRUST_MANAGER), ','),CONCAT(CONCAT(',', emp.EMPLOYEE_ID), ',')) > 0",
+              "join_condition_sql": "inner join urp3_xtdw.dw_d_company_emp_info emp\n    on instr(concat(concat(',', proj.trust_manager), ','),concat(concat(',', emp.employee_id), ',')) > 0"
+            },
+            "2": {
+              "dw_table": "DW_D_COMPANY_EMP_INFO",
+              "dw_alias_in_etl": "T4",
+              "join_condition": "ON INSTR(CONCAT(CONCAT(CONCAT(CONCAT(CONCAT(CONCAT(',', T.TRUST_MANAGER), ','),T.TRUST_MANAGER_B), ','),T.TRUST_MANAGER_C),','),CONCAT(CONCAT(',', T4.EMPLOYEE_ID), ',')) > 0",
+              "join_condition_sql": "inner join urp3_xtdw.dw_d_company_emp_info emp\n    on instr(concat(concat(concat(concat(concat(concat(',', proj.trust_manager), ','),proj.trust_manager_b), ','),proj.trust_manager_c),','),concat(concat(',', emp.employee_id), ',')) > 0"
+            }
+          }
+        },
+        "CTRC_YGH": {
+          "controls": "field_mapping",
+          "description": "控制DM字段取DW哪个字段→对应STG哪个字段",
+          "values": {
+            "1": {
+              "dw_field_expr": "LOGIN_ALIAS",
+              "stg_table": "T2_TCMP_EMPLOYEEINFO",
+              "stg_field_expr": "t.EXT_FIELD_1",
+              "stg_col_name": "EXT_FIELD_1",
+              "stg_col_name_cn": "登录别名"
+            },
+            "2": {
+              "dw_field_expr": "EMPLOYEE_ID",
+              "stg_table": "T2_TCMP_EMPLOYEEINFO",
+              "stg_field_expr": "t.USER_CODE",
+              "stg_col_name": "USER_CODE",
+              "stg_col_name_cn": "用户编码"
+            },
+            "3": {
+              "dw_field_expr": "OUT_SYSTEM_USER_ID",
+              "stg_table": "T2_TCMP_EMPLOYEEINFO",
+              "stg_field_expr": "t.OUT_SYSTEM_USER_ID",
+              "stg_col_name": "OUT_SYSTEM_USER_ID",
+              "stg_col_name_cn": "第三方系统用户ID"
+            },
+            "4": {
+              "dw_field_expr": "NVL(LOGIN_ALIAS, EMPLOYEE_ID)",
+              "stg_table": "T2_TCMP_EMPLOYEEINFO",
+              "stg_field_expr": "NVL(t.EXT_FIELD_1, t.USER_CODE)",
+              "stg_col_name": "EXT_FIELD_1",
+              "stg_col_name_cn": "登录别名"
+            },
+            "5": {
+              "dw_field_expr": "NVL(OUT_SYSTEM_USER_ID, EMPLOYEE_ID)",
+              "stg_table": "T2_TCMP_EMPLOYEEINFO",
+              "stg_field_expr": "NVL(t.OUT_SYSTEM_USER_ID, t.USER_CODE)",
+              "stg_col_name": "OUT_SYSTEM_USER_ID",
+              "stg_col_name_cn": "第三方系统用户ID"
+            }
+          }
+        }
+      }
+    }
+  },
+
+  "dw_stg_mapping": {
+    "DW_D_COMPANY_EMP_INFO": {
+      "EMPLOYEE_ID": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "USER_CODE", "stg_field_cn": "用户编码"},
+      "LOGIN_ALIAS": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "EXT_FIELD_1", "stg_field_cn": "登录别名"},
+      "OUT_SYSTEM_USER_ID": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "OUT_SYSTEM_USER_ID", "stg_field_cn": "第三方系统用户ID"},
+      "EMPLOYEE_NAME": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "USER_NAME", "stg_field_cn": "用户名称"},
+      "DEPT_ID": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "USER_ORG", "stg_field_cn": "部门编码"},
+      "MOBILE": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "MOBILE", "stg_field_cn": "手机号码"},
+      "TELEPHONE": {"stg_table": "T2_TCMP_EMPLOYEEINFO", "stg_field": "TELEPHONE", "stg_field_cn": "电话号码"}
+    }
+  }
+}

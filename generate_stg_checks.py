@@ -24,6 +24,7 @@ generate_stg_checks.py - STG 巡检脚本生成主入口（v2 + v0.7参数展开
 import os
 import sys
 import re
+import json
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -468,6 +469,265 @@ def load_field_param_mapping(xlsx_path: str, param_config: Dict[str, ParamDefini
                      f"涉及 {sum(len(v) for v in lookup.values())} 个参数映射")
     
     return lookup
+
+
+def load_etl_lineage_config(json_path: str, logger=None) -> dict:
+    """
+    加载ETL血缘映射配置（etl_lineage_config.json）。
+    
+    返回结构:
+    {
+      "dm_field_lineage": {
+        "DM_TABLE.DM_FIELD": {
+          "params": {
+            "PARAM_CODE": {
+              "controls": "join_path" | "field_mapping",
+              "values": { "VALUE": { ... } }
+            }
+          }
+        }
+      },
+      "dw_stg_mapping": {
+        "DW_TABLE": { "DW_FIELD": {"stg_table":..., "stg_field":..., "stg_field_cn":...} }
+      }
+    }
+    """
+    if not os.path.exists(json_path):
+        if logger:
+            logger.warn(f"ETL血缘配置文件不存在: {json_path}")
+        return {"dm_field_lineage": {}, "dw_stg_mapping": {}}
+    
+    with open(json_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    lineage_count = len(config.get('dm_field_lineage', {}))
+    dw_count = len(config.get('dw_stg_mapping', {}))
+    
+    if logger:
+        logger.info(f"  ETL血缘配置: {lineage_count} 个DM字段有血缘映射, {dw_count} 个DW表有STG映射")
+    
+    return config
+
+
+def _build_stg_null_check(stg_field_expr: str) -> str:
+    """
+    根据STG字段表达式生成逻辑自洽的空值判断条件。
+    
+    简单字段: trim(t.EXT_FIELD_1) IS NULL
+    NVL组合:   NVL(trim(t.EXT_FIELD_1), trim(t.USER_CODE)) IS NULL
+    
+    遵循 §9.8: STG字段表达式与空值判断必须逻辑自洽。
+    """
+    # 检测 NVL(expr1, expr2) 模式
+    nvl_match = re.match(r'^NVL\((\w+\.\w+),\s*(\w+\.\w+)\)$', stg_field_expr.strip(), re.IGNORECASE)
+    if nvl_match:
+        field_a = nvl_match.group(1)
+        field_b = nvl_match.group(2)
+        return f"NVL(trim({field_a}), trim({field_b})) IS NULL"
+    else:
+        # 简单字段: t.EXT_FIELD_1
+        return f"trim({stg_field_expr.strip()}) IS NULL"
+
+
+def _build_stg_col_name_cn(stg_field_expr: str, lineage_value: dict) -> str:
+    """
+    根据STG字段表达式确定 stg_col_name_cn。
+    
+    简单字段: 直接用 lineage 中的 stg_col_name_cn
+    NVL组合:   取优先字段（NVL第一个参数）的中文名 + "(优先)"
+    """
+    nvl_match = re.match(r'^NVL\((\w+\.\w+),\s*(\w+\.\w+)\)$', stg_field_expr.strip(), re.IGNORECASE)
+    if nvl_match:
+        # NVL组合 - 使用 stg_col_name_cn（配置中已指定为优先字段的中文名）
+        return lineage_value.get('stg_col_name_cn', '')
+    else:
+        return lineage_value.get('stg_col_name_cn', '')
+
+
+def rebuild_sql_with_lineage(
+    base_sql: str,
+    check_info: ReportCheckInfo,
+    insp_row: InspectionRow,
+    param_combo: Dict[str, str],
+    param_config: Dict[str, ParamDefinition],
+    lineage_config: dict,
+    stg_key: str,
+    stg_table_info: dict,
+    has_project: bool,
+    logger=None
+) -> Optional[str]:
+    """
+    根据血缘配置和参数组合，重建完整的巡检SQL。
+    
+    当血缘配置中存在该DM字段的映射时，根据参数组合重建：
+    1. JOIN链（受 join_path 类型参数控制）
+    2. STG表/字段（受 field_mapping 类型参数控制）
+    3. WHERE中的参数过滤条件
+    4. 空值判断条件（与STG字段表达式逻辑自洽）
+    
+    返回 None 表示该字段无血缘配置，应使用原始SQL。
+    """
+    dm_table = (insp_row.dm_table or '').strip().upper()
+    dm_field = (check_info.report_field or '').strip().upper()
+    lineage_key = f"{dm_table}.{dm_field}"
+    
+    field_lineage = lineage_config.get('dm_field_lineage', {}).get(lineage_key)
+    if not field_lineage:
+        return None  # 无血缘配置，不重建
+    
+    params = field_lineage.get('params', {})
+    
+    # 收集每个维度（join_path / field_mapping）的当前值配置
+    join_config = None
+    field_config = None
+    
+    for param_code, param_def in params.items():
+        actual_code = param_code
+        equiv = _get_equivalent_param(param_code)
+        if param_code not in param_config and equiv and equiv in param_config:
+            actual_code = equiv
+        
+        combo_value = param_combo.get(param_code, param_combo.get(actual_code, ''))
+        
+        if not combo_value:
+            if logger:
+                logger.warn(f"  血缘重建: 参数 {param_code} 在组合中未找到值，跳过")
+            continue
+        
+        values = param_def.get('values', {})
+        value_config = values.get(str(combo_value))
+        if not value_config:
+            if logger:
+                logger.warn(f"  血缘重建: 参数 {param_code}={combo_value} 在血缘配置中未找到")
+            continue
+        
+        controls = param_def.get('controls', '')
+        if controls == 'join_path':
+            join_config = value_config
+        elif controls == 'field_mapping':
+            field_config = value_config
+    
+    if not field_config:
+        return None  # 没有字段映射配置，无法重建
+    
+    # 构建重建SQL
+    stg_table = field_config.get('stg_table', '')
+    stg_col_name = field_config.get('stg_col_name', '')
+    stg_col_name_cn = field_config.get('stg_col_name_cn', '')
+    stg_field_expr = field_config.get('stg_field_expr', '')
+    
+    # stg_key: 根据STG表确定
+    stg_key_expr = stg_key  # 保留原始stg_key逻辑
+    
+    # JOIN条件
+    join_sql = ''
+    if join_config:
+        join_sql = join_config.get('join_condition_sql', '')
+        # 替换ETL中的别名 T → proj, T2/T4 → emp
+        join_sql = join_sql.replace('T.', 'proj.')
+    
+    # 空值判断条件
+    null_check = _build_stg_null_check(stg_field_expr)
+    
+    # stg_col_name_cn for NVL
+    stg_col_name_cn = _build_stg_col_name_cn(stg_field_expr, field_config)
+    
+    # WHERE参数过滤条件
+    param_filters = []
+    for param_code in params.keys():
+        actual_code = param_code
+        equiv = _get_equivalent_param(param_code)
+        if param_code not in param_config and equiv and equiv in param_config:
+            actual_code = equiv
+        combo_value = param_combo.get(param_code, param_combo.get(actual_code, ''))
+        if combo_value:
+            label = build_param_value_label(param_code, combo_value, param_config)
+            param_filters.append(
+                f"   AND (SELECT param_value FROM urp3.URP_PARAM_CONFIG t \n"
+                f"         WHERE param_code = '{param_code}' AND status = '1') = '{combo_value}'"
+                f"  --{label}"
+            )
+    
+    # 组装SQL
+    check_name = check_info.check_name
+    
+    # 判断是否项目相关
+    if has_project:
+        business_fields = BUSINESS_FIELDS
+    else:
+        business_fields = NO_PROJECT_FIELDS
+    
+    # 确定STG表的stg_key
+    # T2_TCMP_EMPLOYEEINFO → '用户编码['||user_code||'],用户名称['||user_name||']'
+    stg_key_for_table = stg_key_expr
+    if not stg_key_for_table and stg_table == 'T2_TCMP_EMPLOYEEINFO':
+        stg_key_for_table = "'用户编码['||user_code||'],用户名称['||user_name||']'"
+    
+    sql_parts = []
+    sql_parts.append(f"select distinct  --勾稽名称")
+    sql_parts.append(f"       '{check_name}' check_name,")
+    sql_parts.append(f"       --STG要素")
+    sql_parts.append(f"       '{stg_table}' stg_table_name,")
+    sql_parts.append(f"        '{_get_stg_table_cn(stg_table)}' stg_table_name_cn,")
+    sql_parts.append(f"        '{stg_col_name}' stg_col_name,")
+    sql_parts.append(f"        '{stg_col_name_cn}' stg_col_name_cn,    ")
+    sql_parts.append(f"       {stg_field_expr} stg_col_value,")
+    sql_parts.append(f"       {stg_key_for_table} stg_key,")
+    sql_parts.append(f"       --固定字段")
+    sql_parts.append(business_fields)
+    sql_parts.append(REPORT_FLAG_FIELDS)
+    
+    # FROM + JOIN
+    sql_parts.append(f" from  urp3_tusp.{dm_table} k")
+    sql_parts.append("inner join urp3_xtdw.dw_d_count_proj_info proj")
+    sql_parts.append("ON     k.count_proj_code = proj.count_proj_code  AND proj.data_source='TCMP'")
+    
+    if join_sql:
+        sql_parts.append(join_sql)
+    
+    sql_parts.append(f"inner join urp3_xtstg.{stg_table} t")
+    sql_parts.append(f"\ton emp.employee_id=t.user_code ")
+    
+    # WHERE
+    sql_parts.append(f"where  k.cal_date = 20250331 and (k.report_flag_tprt = '1' or k.report_flag_east5 = '1')  and   proj.busi_scope = '1' and  ")
+    sql_parts.append(f" -- DM限定条件")
+    sql_parts.append(f"  {null_check}")
+    
+    # 参数过滤条件
+    for pf in param_filters:
+        sql_parts.append(pf)
+    
+    rebuilt_sql = '\n'.join(sql_parts)
+    
+    # 添加注释头
+    param_labels = []
+    for code, value in param_combo.items():
+        param_labels.append(build_param_value_label(code, value, param_config))
+    
+    header_lines = []
+    header_lines.append(f"--报表字段：{check_info.report_table}.{check_info.report_field}")
+    header_lines.append(f"--DM字段：{dm_table}.{dm_field}")
+    header_lines.append(f"-- 参数组合: {', '.join(param_labels)}")
+    header_lines.append(f"-- 检查编号: {check_info.check_code}")
+    header_lines.append(f"-- 勾稽名称: {check_name}")
+    header = '\n'.join(header_lines) + '\n'
+    
+    rebuilt_sql = header + rebuilt_sql
+    
+    if logger:
+        logger.info(f"  血缘重建: {lineage_key} 参数组合 {param_combo} → STG={stg_table}.{stg_col_name}({stg_col_name_cn})")
+    
+    return rebuilt_sql
+
+
+def _get_stg_table_cn(stg_table: str) -> str:
+    """根据STG表名返回中文名"""
+    _STG_TABLE_CN = {
+        'T2_TCMP_PROJECTINFO': '项目信息',
+        'T2_TCMP_EMPLOYEEINFO': '员工信息表',
+        'T2_TCMP_DEPARTMENTINFO': '部门信息',
+    }
+    return _STG_TABLE_CN.get(stg_table, stg_table)
 
 
 def _build_sql_header(check_info: ReportCheckInfo, insp_row: Optional[InspectionRow] = None,
@@ -1181,6 +1441,7 @@ def main():
     table_structure_path = os.path.join(base_dir, "table_structure_list.xlsx")
     param_config_path = os.path.join(base_dir, "code_param_list.xlsx")
     field_param_mapping_path = os.path.join(base_dir, "param_field_mapping.xlsx")
+    lineage_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "etl_lineage_config.json")
     output_dir = os.path.join(base_dir, "output_stg_file")
     log_path = os.path.join(output_dir, "generation_log.txt")
 
@@ -1217,6 +1478,15 @@ def main():
     else:
         if logger:
             logger.info(f"字段级参数映射文件不存在或无参数配置，跳过")
+    
+    # 2f. 加载ETL血缘配置（v0.9新增）
+    lineage_config = {"dm_field_lineage": {}, "dw_stg_mapping": {}}
+    if param_config and os.path.exists(lineage_config_path):
+        logger.info(f"加载ETL血缘配置: {lineage_config_path}")
+        lineage_config = load_etl_lineage_config(lineage_config_path, logger)
+    else:
+        if logger:
+            logger.info(f"ETL血缘配置文件不存在，跳过血缘重建")
 
     # 3. 加载 STG 业务主键
     logger.info(f"加载 STG 业务主键: {stg_key_path}")
@@ -1270,15 +1540,24 @@ def main():
                 else:
                     match_type = "DM_SUPPLEMENT_ASSEMBLE"
         
-        # v0.8: 参数展开 — 三种触发条件
-        # 1) SQL包含URP_PARAM_CONFIG引用
-        # 2) SQL模板包含#[PARAM]占位符
-        # 3) 字段级映射表明该字段受业务参数控制（即使SQL中无参数引用）
+        # v0.9: 参数展开 — 优先使用血缘重建
+        # 1) 检查血缘配置中是否有该DM字段的完整映射
+        # 2) 如有，使用血缘重建生成结构不同的SQL
+        # 3) 如无，退回v0.8逻辑（WHERE条件替换）
         has_sql_param_ref = 'URP_PARAM_CONFIG' in base_sql
         has_template_param = insp_row and insp_row.sql_template and '#[' in insp_row.sql_template
         
+        # v0.9: 检查血缘配置
+        lineage_key = ''
+        has_lineage = False
+        if param_config and insp_row and lineage_config.get('dm_field_lineage'):
+            dm_table_l = (insp_row.dm_table or '').strip().upper()
+            dm_field_l = (check.report_field or '').strip().upper()
+            lineage_key = f"{dm_table_l}.{dm_field_l}"
+            has_lineage = lineage_key in lineage_config['dm_field_lineage']
+        
         field_param_codes = None
-        if param_config and insp_row and not has_sql_param_ref and not has_template_param:
+        if param_config and insp_row and not has_sql_param_ref and not has_template_param and not has_lineage:
             dm_table = (insp_row.dm_table or '').strip().upper()
             dm_field = (check.report_field or '').strip().upper()
             lookup_key = (dm_table, dm_field)
@@ -1288,8 +1567,66 @@ def main():
                     logger.info(f"  检查项 {check.check_code} 字段 {dm_table}.{dm_field} "
                                 f"受业务参数控制: {field_param_codes}（来自字段级映射）")
         
-        if param_config and insp_row and (has_sql_param_ref or has_template_param or field_param_codes):
-            # SQL包含参数引用或字段受参数控制，尝试展开
+        if param_config and insp_row and has_lineage:
+            # v0.9: 血缘重建路径 — 参数驱动SQL结构重建
+            field_lineage = lineage_config['dm_field_lineage'][lineage_key]
+            lineage_params = field_lineage.get('params', {})
+            
+            # 确定参与展开的参数代码
+            lineage_business_codes = list(lineage_params.keys())
+            
+            # 计算笛卡尔积
+            combos = expand_business_params(param_config, lineage_business_codes)
+            
+            if len(combos) > 1:
+                lineage_rebuilt_count = 0
+                for combo in combos:
+                    rebuilt_sql = rebuild_sql_with_lineage(
+                        base_sql=base_sql,
+                        check_info=check,
+                        insp_row=insp_row,
+                        param_combo=combo,
+                        param_config=param_config,
+                        lineage_config=lineage_config,
+                        stg_key=stg_key,
+                        stg_table_info=stg_table_info,
+                        has_project=is_project_related(check),
+                        logger=logger
+                    )
+                    
+                    if rebuilt_sql:
+                        param_labels = []
+                        for code, value in combo.items():
+                            param_labels.append(build_param_value_label(code, value, param_config))
+                        
+                        sql_list.append((
+                            check.check_code,
+                            rebuilt_sql,
+                            combo,
+                            lineage_business_codes,
+                            param_labels,
+                            'LINEAGE_REBUILD',
+                            insp_row
+                        ))
+                        lineage_rebuilt_count += 1
+                    else:
+                        if logger:
+                            logger.warn(f"  血缘重建返回None: {lineage_key} combo={combo}")
+                
+                if lineage_rebuilt_count > 0:
+                    param_expanded_count += lineage_rebuilt_count - 1
+                    if logger:
+                        logger.info(f"  检查项 {check.check_code} 血缘重建: 生成 {lineage_rebuilt_count} 份SQL")
+            else:
+                # 只有1种组合，仍用原SQL
+                sql_list.append((
+                    check.check_code, base_sql, {}, [], [],
+                    match_type, insp_row
+                ))
+                param_no_expand_count += 1
+        
+        elif param_config and insp_row and (has_sql_param_ref or has_template_param or field_param_codes):
+            # v0.8: 原有路径 — SQL模板含参数引用时，仅替换WHERE条件
             expanded = generate_param_expanded_sqls(
                 sql=base_sql,
                 check_info=check,
