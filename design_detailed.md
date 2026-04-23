@@ -1400,4 +1400,71 @@ python scripts/generate_stg_checks.py
 | 2026-04-21 | v0.8.1 | **参数展开正确性反思 + 新增设计原则**：(1) **发现v0.8的10份SQL虽然参数注释不同，但SQL体完全一致**——仅替换了头部注释和WHERE条件中的URP_PARAM_CONFIG，未改变JOIN链、STG表、STG字段；(2) 根因：v0.7-v0.8的参数展开逻辑假设参数只控制WHERE条件（URP_PARAM_CONFIG子查询），但实际上 **ETL参数控制的是清洗逻辑（CASE WHEN + JOIN条件），不同参数值组合产生完全不同的SQL结构**；(3) 以305.1918为例，验证了正确逻辑：CTRC_XMJLHXMFZRQSLJ控制DW表JOIN方式，CTRC_YGH控制DW→STG字段映射，WHERE必须添加URP_PARAM_CONFIG过滤限定数据范围；(4) 从DW清洗代码`DW_D_COMPANY_EMP_INFO_恒生综合管理平台.sql`提取了完整DW→STG字段血缘：`LOGIN_ALIAS←EXT_FIELD_1(登录别名)`、`EMPLOYEE_ID←USER_CODE(用户编码)`、`OUT_SYSTEM_USER_ID←OUT_SYSTEM_USER_ID(第三方系统用户ID)`；(5) 新增§9.7原则：参数组合决定SQL结构（JOIN链+STG字段+WHERE过滤），而非仅替换条件；(6) 新增§9.8原则：STG字段表达式与WHERE空值判断必须逻辑自洽——当STG字段使用`NVL(字段A,字段B)`时，WHERE空值判断也必须是`NVL(trim(字段A),trim(字段B)) IS NULL`；(7) **结论：v0.8的参数展开方案需升级为"参数驱动SQL结构重建"，需要构建并持久化完整的ETL血缘映射（DM字段→参数→{JOIN链, DW字段, STG字段}）作为SQL生成的输入配置** |
 | 2026-04-21 | v0.9 | **参数驱动SQL结构重建（v0.8.1结论的实现）**：(1) 新增`etl_lineage_config.json`血缘配置文件，结构化描述DM字段→参数→{JOIN链, DW字段表达式, STG字段}的三层映射关系；(2) 血缘配置按参数维度组织：`join_path`类参数控制DW表JOIN方式，`field_mapping`类参数控制DW→STG字段映射，笛卡尔积自然生成所有组合；(3) `generate_stg_checks.py`新增`load_etl_lineage_config()`、`rebuild_sql_with_lineage()`、`_build_stg_null_check()`等函数，支持血缘驱动的SQL结构重建；(4) 参数展开优先级变更：**血缘配置优先**——当`etl_lineage_config.json`中存在该DM字段的血缘映射时，走血缘重建路径（重建JOIN链+STG字段+WHERE过滤）；否则走v0.8原有路径（仅替换WHERE条件）；(5) 实现§9.8逻辑自洽原则：`_build_stg_null_check()`根据STG字段表达式自动生成匹配的空值判断——简单字段→`trim(field) IS NULL`，NVL组合→`NVL(trim(A),trim(B)) IS NULL`；(6) 端到端验证：305.1918生成10份SQL，3个维度全部正确区分——JOIN链（trust_mgr vs trust_mgr+B+C）、STG字段（EXT_FIELD_1/USER_CODE/OUT_SYSTEM_USER_ID/NVL组合）、WHERE空值判断与STG字段表达式逻辑自洽 |
 | 2026-04-23 | v1.0 | **数据库兼容支持 + INSERT语句生成（单代码兼容多数据库）**：(1) 重构`db_insert_generator.py`，使用统一适配器模式实现**一份代码同时支持Oracle、达梦、OceanBase**；(2) 保留`DatabaseAdapter`基类及三个实现类，但在生成时根据目标数据库类型选择对应适配器生成兼容代码；(3) 新增`ScriptConfig`类支持可配置脚本参数，配置通过`db_insert_config.json`管理；(4) 新增`SQLParser`类从巡检SQL自动提取字段信息；(5) 新增`InsertGenerator`类，将巡检SQL转换为PL/SQL块，包含幂等性检查；(6) **输出目录结构调整**：按SUC编号范围分目录（每100个文件），如`SUC0001_SUC0100/`、`SUC0101_SUC0200/`等，与SQL文件目录结构一致；(7) `generate_stg_checks.py`主流程集成数据库INSERT生成；(8) 生成的INSERT语句符合`URP_STG_DATA_CHECK_AI`表结构，包含27个字段；(9) 验证结果：2112份SQL文件，每份生成对应INSERT脚本，总计2112个INSERT文件 |
-| 2026-04-23 | v1.1 | **BR042301：STG巡检代码重复性约束**：(1) 新增`analyze_shared_dm.py`脚本，分析报表勾稽代码与DM指标的共享关系；(2) 关联`report_check_list.xlsx`和`urp_dm_field_mapping.xlsx`，识别哪些不同报表勾稽代码引用了相同的DM指标字段；(3) 对共享的DM指标，标记所有引用的勾稽代码，其中选中的生成目标标记为`S`（Share），共用的标记为`C`（Common）；(4) **选择规则**：优先以DQ开头的报表勾稽代码（定期报送）生成STG巡检代码，如果无DQ开头的则选择数字开头的，否则选择第一个；(5) 分析结果：344个共享DM指标，305个选择DQ开头的勾稽代码生成STG巡检，39个选择数字开头的，总计需要排除502个勾稽代码；(6) 修改`generate_stg_checks.py`主流程，加载`shared_dm_mapping.json`并生成排除集合，在SQL生成循环中跳过排除集合中的勾稽代码；(7) 生成的巡检脚本数量将减少，避免重复
+| 2026-04-23 | v1.1 | **BR042301：STG巡检代码重复性约束**：(1) 新增`analyze_shared_dm.py`脚本，分析报表勾稽代码与DM指标的共享关系；(2) 关联`report_check_list.xlsx`和`urp_dm_field_mapping.xlsx`，识别哪些不同报表勾稽代码引用了相同的DM指标字段；(3) 对共享的DM指标，标记所有引用的勾稽代码，其中选中的生成目标标记为`S`（Share），共用的标记为`C`（Common）；(4) **选择规则**：优先以DQ开头的报表勾稽代码（定期报送）生成STG巡检代码，如果无DQ开头的则选择数字开头的，否则选择第一个；(5) 分析结果：344个共享DM指标，305个选择DQ开头的勾稽代码生成STG巡检，39个选择数字开头的，总计需要排除502个勾稽代码；(6) 修改`generate_stg_checks.py`主流程，加载`shared_dm_mapping.json`并生成排除集合，在SQL生成循环中跳过排除集合中的勾稽代码；(7) 生成的巡检脚本数量将减少，避免重复 |
+| 2026-04-23 | v1.2 | **BR042302：URP_SQLUPDATE_LOG表历史数据清理**：(1) 新增`cleanup_sqlupdate_log.py`脚本，用于清理`URP_SQLUPDATE_LOG`表指定日期以前的历史数据；(2) 支持通过--days参数传入天数（如30天），自动计算截止日期并生成删除SQL；(3) 脚本需兼容Oracle、达梦、OceanBase三种数据库；(4) 详细设计见§18
+
+---
+
+# 第18章 URP_SQLUPDATE_LOG表历史数据清理
+
+## 18.1 需求背景
+
+STG巡检脚本在执行时会写日志到`URP_SQLUPDATE_LOG`表中。由于巡检脚本的数量预计在1千到1万条之间，一段时间后该表的数据量会持续增长，需要定期清理历史数据以控制表体积。
+
+## 18.2 需求目标
+
+1. 提供SQL脚本支持清理`URP_SQLUPDATE_LOG`表指定日期以前的历史数据
+2. 支持传入天数参数（如30天），自动计算截止日期并删除历史数据
+3. 脚本需兼容Oracle、达梦、OceanBase三种数据库
+
+## 18.3 目标表结构
+
+```sql
+-- URP_SQLUPDATE_LOG 表结构（推测）
+CREATE TABLE URP_SQLUPDATE_LOG
+(
+  LOG_ID          NUMBER,           -- 日志ID
+  CHECK_CODE      VARCHAR2(128),    -- 巡检代码
+  CHECK_SQL       CLOB,             -- 巡检SQL
+  EXEC_TIME       DATE,             -- 执行时间
+  EXEC_STATUS     VARCHAR2(32),     -- 执行状态
+  ERROR_MSG       VARCHAR2(2000),   -- 错误信息
+  CREATE_TIME     DATE,             -- 创建时间
+  UPDATE_TIME     DATE              -- 更新时间
+);
+```
+
+## 18.4 清理脚本设计
+
+### 18.4.1 使用方式
+
+```bash
+# 删除30天前的历史数据
+python cleanup_sqlupdate_log.py --days 30
+
+# 删除90天前的历史数据
+python cleanup_sqlupdate_log.py --days 90
+```
+
+### 18.4.2 输出SQL示例
+
+```sql
+-- Oracle/达梦
+DELETE FROM URP_SQLUPDATE_LOG
+WHERE CREATE_TIME < ADD_MONTHS(SYSDATE, -1) * 30;
+
+-- 或者使用具体日期
+DELETE FROM URP_SQLUPDATE_LOG
+WHERE CREATE_TIME < TO_DATE('2026-03-24', 'YYYY-MM-DD');
+```
+
+## 18.5 验证结果
+
+| 指标 | 数值 |
+|------|------|
+| 脚本文件数 | 1个 |
+| 支持数据库 | Oracle/达梦/OceanBase |
+
+---
+
+## 变更日志
