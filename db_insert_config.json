@@ -1,0 +1,11 @@
+{
+  "script_type": "1",
+  "script_name_prefix": "STG_CHECK",
+  "app_version_no": "URP3.0.V202502.13.000",
+  "customer_source": "HUNDSUN",
+  "env_id": "001",
+  "rely_version": "URP3.0.V202502.06.000",
+  "enabled_status": 1,
+  "status": 1,
+  "description": "STG巡检脚本INSERT生成配置"
+}

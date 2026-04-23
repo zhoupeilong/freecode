@@ -1488,6 +1488,31 @@ def main():
         if logger:
             logger.info(f"ETL血缘配置文件不存在，跳过血缘重建")
 
+    # 2g. 加载共享DM指标映射（v1.1新增 - STG巡检代码重复性约束）
+    # 目标：多个报表勾稽代码引用相同DM指标时，只生成一份STG巡检代码
+    # 优先以DQ开头的报表勾稽代码生成STG巡检代码
+    exclusion_set = set()
+    shared_dm_mapping_path = os.path.join(output_dir, "shared_dm_mapping.json")
+    if os.path.exists(shared_dm_mapping_path):
+        logger.info(f"加载共享DM指标映射: {shared_dm_mapping_path}")
+        import json
+        with open(shared_dm_mapping_path, 'r', encoding='utf-8') as f:
+            shared_dm_data = json.load(f)
+
+        # 从映射中提取需要排除的勾稽代码
+        for dm_key, info in shared_dm_data.items():
+            selected = info.get('selected_code', '')
+            all_codes = info.get('all_codes', [])
+            # 选中的是生成目标，其他的是排除对象
+            for code in all_codes:
+                if code != selected:
+                    exclusion_set.add(code)
+
+        logger.info(f"共享DM指标数: {len(shared_dm_data)}")
+        logger.info(f"需要排除的勾稽代码数: {len(exclusion_set)}")
+    else:
+        logger.info(f"共享DM指标映射文件不存在，跳过去重逻辑")
+
     # 3. 加载 STG 业务主键
     logger.info(f"加载 STG 业务主键: {stg_key_path}")
     stg_key_map = load_stg_key_list(stg_key_path)
@@ -1510,6 +1535,13 @@ def main():
     placeholder_count = 0
 
     for i, check in enumerate(checks, start=1):
+        # v1.1: STG巡检代码重复性约束 - 检查是否需要跳过
+        # 如果勾稽代码在排除集合中，说明它引用的DM指标已被其他勾稽代码共享
+        # 此时不需要生成独立的STG巡检代码
+        if check.check_code in exclusion_set:
+            logger.info(f"跳过 {check.check_code}（该勾稽代码引用的DM指标已被共享）")
+            continue
+
         insp_row = find_mapping_for_check(check, mapping, logger)
         stg_key = ""
         if insp_row:
@@ -1739,6 +1771,25 @@ def main():
     # 写入 md 和 csv（需要更新write_mapping_csv/md以支持新字段）
     write_mapping_md(mapping_records, output_dir, logger)
     write_mapping_csv(mapping_records, output_dir, logger)
+
+    # 6c. 生成数据库INSERT语句（Oracle/达梦/OceanBase）
+    logger.section("第5步：生成数据库INSERT语句")
+    try:
+        from db_insert_generator import generate_all_db_versions, ScriptConfig
+
+        # 加载配置
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_insert_config.json")
+        script_config = ScriptConfig(config_path)
+
+        # 生成所有数据库版本的INSERT语句
+        db_output_dir = os.path.join(output_dir, "db_ver")
+        generate_all_db_versions(output_dir, db_output_dir, config_path)
+
+        logger.info(f"数据库INSERT语句已生成到: {db_output_dir}")
+    except ImportError as e:
+        logger.warn(f"db_insert_generator模块未找到，跳过数据库INSERT生成: {e}")
+    except Exception as e:
+        logger.warn(f"生成数据库INSERT语句失败: {e}")
 
     # 7. 生成摘要
     mandatory_count = sum(1 for c in checks if not c.is_conditional)
