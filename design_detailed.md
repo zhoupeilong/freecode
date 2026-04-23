@@ -1398,13 +1398,6 @@ python scripts/generate_stg_checks.py
 | 2026-04-21 | v0.7.2 | **param_field_mapping.xlsx数据修复 + 设计原则更新**：(1) 发现`param_field_mapping.xlsx`仅包含136条映射（仅来自巡检列`my_poor_solution.xlsx`），缺失了ETL清洗文件解析的3635条映射，导致`DM_CTRC_XTCPLXRXXZBB.XMJLHXMFZRGH`字段的`CTRC_XMJLHXMFZRQSLJ`和`CTRC_YGH`两个业务参数未生成笛卡尔积展开（仅生成1份SUC1394而非预期的10份）；(2) 根因：`parse_etl_params.py`的`main()`函数虽合并了ETL解析结果和巡检列解析结果（共2045条去重映射），但上次写入xlsx时可能因权限错误导致ETL部分未保存；(3) 修复：重新运行`parse_etl_params.py`以生成完整的2045条映射；(4) **重要设计原则**：禁止参考`my_poor_solution.xlsx`中的方案作为SQL模板来源，该文件会误导参数控制逻辑 |
 | 2026-04-21 | v0.8 | **字段级参数映射注入 + 嵌套CASE WHEN解析**（解决305.1918仅生成1份SQL的问题）：(1) `parse_etl_params.py`新增Step 3b——检测外层CASE WHEN `END AS field_alias` 的THEN表达式中嵌套的`#[PARAM]`引用，将嵌套参数也映射到同一field_alias（如`CTRC_YGH`映射到`XMJLHXMFZRGH`）；(2) 重新运行后`param_field_mapping.xlsx`从2045条扩展到2456条；(3) `generate_stg_checks.py`新增`load_field_param_mapping()`函数，从`param_field_mapping.xlsx`构建`(dm_table, dm_field) → [param_code, ...]`查找表；(4) 参数展开入口条件扩展为三种触发：SQL含URP_PARAM_CONFIG / SQL模板含#[PARAM]占位符 / **字段级映射表明该字段受业务参数控制**（即使SQL中无参数引用）；(5) `generate_param_expanded_sqls()`新增`field_param_codes`参数，支持外部传入字段级映射的参数代码进行展开；(6) 修复SQL头部`-- 参数组合:`注释无法插入的问题——改用"在`-- 检查编号:`前插入"策略，兼容含额外注释行（如DM补充⚠️注释）的SQL；(7) 验证结果：305.1918生成10份SQL（2×5笛卡尔积），总SQL文件2112份，509份含参数标注 |
 | 2026-04-21 | v0.8.1 | **参数展开正确性反思 + 新增设计原则**：(1) **发现v0.8的10份SQL虽然参数注释不同，但SQL体完全一致**——仅替换了头部注释和WHERE条件中的URP_PARAM_CONFIG，未改变JOIN链、STG表、STG字段；(2) 根因：v0.7-v0.8的参数展开逻辑假设参数只控制WHERE条件（URP_PARAM_CONFIG子查询），但实际上 **ETL参数控制的是清洗逻辑（CASE WHEN + JOIN条件），不同参数值组合产生完全不同的SQL结构**；(3) 以305.1918为例，验证了正确逻辑：CTRC_XMJLHXMFZRQSLJ控制DW表JOIN方式，CTRC_YGH控制DW→STG字段映射，WHERE必须添加URP_PARAM_CONFIG过滤限定数据范围；(4) 从DW清洗代码`DW_D_COMPANY_EMP_INFO_恒生综合管理平台.sql`提取了完整DW→STG字段血缘：`LOGIN_ALIAS←EXT_FIELD_1(登录别名)`、`EMPLOYEE_ID←USER_CODE(用户编码)`、`OUT_SYSTEM_USER_ID←OUT_SYSTEM_USER_ID(第三方系统用户ID)`；(5) 新增§9.7原则：参数组合决定SQL结构（JOIN链+STG字段+WHERE过滤），而非仅替换条件；(6) 新增§9.8原则：STG字段表达式与WHERE空值判断必须逻辑自洽——当STG字段使用`NVL(字段A,字段B)`时，WHERE空值判断也必须是`NVL(trim(字段A),trim(字段B)) IS NULL`；(7) **结论：v0.8的参数展开方案需升级为"参数驱动SQL结构重建"，需要构建并持久化完整的ETL血缘映射（DM字段→参数→{JOIN链, DW字段, STG字段}）作为SQL生成的输入配置** |
-| 2026-04-21 | v0.9 | **参数驱动SQL结构重建（v0.8.1结论的实现）**：(1) 新增`etl_lineage_config.json`血缘配置文件，结构化描述DM字段→参数→{JOIN链, DW字段表达式, STG字段}的三层映射关系；(2) 血缘配置按参数维度组织：`join_path`类参数控制DW表JOIN方式，`field_mapping`类参数控制DW→STG字段映射，笛卡尔积自然生成所有组合；(3) `generate_stg_checks.py`新增`load_etl_lineage_config()`、`rebuild_sql_with_lineage()`、`_build_stg_null_check()`等函数，支持血缘驱动的SQL结构重建；(4) 参数展开优先级变更：**血缘配置优先**——当`etl_lineage_config.json`中存在该DM字段的血缘映射时，走血缘重建路径（重建JOIN链+STG字段+WHERE过滤）；否则走v0.8原有路径（仅替换WHERE条件）；(5) 实现§9.8逻辑自洽原则：`_build_stg_null_check()`根据STG字段表达式自动生成匹配的空值判断——简单字段→`trim(field) IS NULL`，NVL组合→`NVL(trim(A),trim(B)) IS NULL`；(6) 端到端验证：305.1918生成10份SQL，3个维度全部正确区分——JOIN链（trust_mgr vs trust_mgr+B+C）、STG字段（EXT_FIELD_1/USER_CODE/OUT_SYSTEM_USER_ID/NVL组合）、WHERE空值判断与STG字段表达式逻辑自洽 |
-| 2026-04-23 | v1.0 | **数据库兼容支持 + INSERT语句生成（单代码兼容多数据库）**：(1) 重构`db_insert_generator.py`，使用统一适配器模式实现**一份代码同时支持Oracle、达梦、OceanBase**；(2) 保留`DatabaseAdapter`基类及三个实现类，但在生成时根据目标数据库类型选择对应适配器生成兼容代码；(3) 新增`ScriptConfig`类支持可配置脚本参数，配置通过`db_insert_config.json`管理；(4) 新增`SQLParser`类从巡检SQL自动提取字段信息；(5) 新增`InsertGenerator`类，将巡检SQL转换为PL/SQL块，包含幂等性检查；(6) **输出目录结构调整**：按SUC编号范围分目录（每100个文件），如`SUC0001_SUC0100/`、`SUC0101_SUC0200/`等，与SQL文件目录结构一致；(7) `generate_stg_checks.py`主流程集成数据库INSERT生成；(8) 生成的INSERT语句符合`URP_STG_DATA_CHECK_AI`表结构，包含27个字段；(9) 验证结果：2112份SQL文件，每份生成对应INSERT脚本，总计2112个INSERT文件 |
-| 2026-04-23 | v1.1 | **BR042301：STG巡检代码重复性约束**：(1) 新增`analyze_shared_dm.py`脚本，分析报表勾稽代码与DM指标的共享关系；(2) 关联`report_check_list.xlsx`和`urp_dm_field_mapping.xlsx`，识别哪些不同报表勾稽代码引用了相同的DM指标字段；(3) 对共享的DM指标，标记所有引用的勾稽代码，其中选中的生成目标标记为`S`（Share），共用的标记为`C`（Common）；(4) **选择规则**：优先以DQ开头的报表勾稽代码（定期报送）生成STG巡检代码，如果无DQ开头的则选择数字开头的，否则选择第一个；(5) 分析结果：344个共享DM指标，305个选择DQ开头的勾稽代码生成STG巡检，39个选择数字开头的，总计需要排除502个勾稽代码；(6) 修改`generate_stg_checks.py`主流程，加载`shared_dm_mapping.json`并生成排除集合，在SQL生成循环中跳过排除集合中的勾稽代码；(7) 生成的巡检脚本数量将减少，避免重复 |
-| 2026-04-23 | v1.2 | **BR042302：URP_SQLUPDATE_LOG表历史数据清理**：(1) 新增`cleanup_sqlupdate_log.py`脚本，用于清理`URP_SQLUPDATE_LOG`表指定日期以前的历史数据；(2) 支持通过--days参数传入天数（如30天），自动计算截止日期并生成删除SQL；(3) 脚本需兼容Oracle、达梦、OceanBase三种数据库；(4) 详细设计见§18
-
----
-
 # 第18章 URP_SQLUPDATE_LOG表历史数据清理
 
 ## 18.1 需求背景
@@ -1436,27 +1429,58 @@ CREATE TABLE URP_SQLUPDATE_LOG
 
 ## 18.4 清理脚本设计
 
-### 18.4.1 使用方式
+### 18.4.1 SQL脚本内容
 
-```bash
-# 删除30天前的历史数据
-python cleanup_sqlupdate_log.py --days 30
-
-# 删除90天前的历史数据
-python cleanup_sqlupdate_log.py --days 90
-```
-
-### 18.4.2 输出SQL示例
+脚本文件：`cleanup_sqlupdate_log.sql`
 
 ```sql
--- Oracle/达梦
-DELETE FROM URP_SQLUPDATE_LOG
-WHERE CREATE_TIME < ADD_MONTHS(SYSDATE, -1) * 30;
+-- ============================================================
+-- URP_SQLUPDATE_LOG 表历史数据清理脚本
+-- 功能：清理指定日期以前的历史数据
+-- 支持：Oracle、达梦、OceanBase
+-- ============================================================
 
--- 或者使用具体日期
-DELETE FROM URP_SQLUPDATE_LOG
-WHERE CREATE_TIME < TO_DATE('2026-03-24', 'YYYY-MM-DD');
+-- 【请修改此参数】保留天数（天）
+DEFINE DAYS_TO_KEEP = 30;
+
+-- ============================================================
+-- Oracle/达梦 版本
+-- ============================================================
+-- 1. 查看将删除的数据量（执行前先确认）
+-- SELECT COUNT(*) AS DELETE_COUNT
+-- FROM URP_SQLUPDATE_LOG
+-- WHERE CREATE_TIME < SYSDATE - &DAYS_TO_KEEP;
+
+-- 2. 执行清理
+-- DELETE FROM URP_SQLUPDATE_LOG
+-- WHERE CREATE_TIME < SYSDATE - &DAYS_TO_KEEP;
+
+-- 3. 提交事务
+-- COMMIT;
+
+-- ============================================================
+-- OceanBase (MySQL模式) 版本
+-- ============================================================
+-- 1. 查看将删除的数据量（执行前先确认）
+-- SELECT COUNT(*) AS DELETE_COUNT
+-- FROM URP_SQLUPDATE_LOG
+-- WHERE CREATE_TIME < DATE_SUB(NOW(), INTERVAL &DAYS_TO_KEEP DAY);
+
+-- 2. 执行清理
+-- DELETE FROM URP_SQLUPDATE_LOG
+-- WHERE CREATE_TIME < DATE_SUB(NOW(), INTERVAL &DAYS_TO_KEEP DAY);
+
+-- 3. 提交事务
+-- COMMIT;
 ```
+
+### 18.4.2 使用说明
+
+1. 根据实际数据库类型，注释/取消注释对应版本的SQL
+2. 修改`DAYS_TO_KEEP`参数值（保留天数）
+3. 先执行SELECT查询确认将删除的数据量
+4. 确认无误后执行DELETE语句
+5. 执行COMMIT提交事务
 
 ## 18.5 验证结果
 
@@ -1468,3 +1492,22 @@ WHERE CREATE_TIME < TO_DATE('2026-03-24', 'YYYY-MM-DD');
 ---
 
 ## 变更日志
+
+| 日期 | 版本 | 变更内容 |
+|------|------|---------|
+| 2026-04-17 | v0.1 | 初始版本：概要设计、核心模块、日志格式 |
+| 2026-04-17 | v0.2 | 新增章节 7（复杂取数场景的风险与实现方案），涵盖场景 3-6 |
+| 2026-04-17 | v0.3 | 新增章节 6（XSFS 实例验证），补充参数占位符、同表多 JOIN、外层 WHERE 条件、SourceRule 扩展、日志规范 |
+| 2026-04-21 | v0.4 | **重大修正**：映射策略从"STG到DM表映射"改为"巡检列为主映射源"；移除策略3（同报表名取第一行）避免字段错配；新增工作原则章节 §9；DM字段映射补充行标记 `is_from_dm_supplement` 防止借用模板中硬编码字段污染 |
+| 2026-04-21 | v0.4.1 | 补充变更详情：(1) 原策略3导致635条SQL检查了错误字段，已移除；(2) 精确匹配733条+DM字段映射补充846条+占位167条=1746条，覆盖率90.4%；(3) 对DM补充行借用SQL模板的情况，标记is_from_dm_supplement=True，使用拼装而非借用的硬编码模板；(4) 新增§8.5勾稽代码↔SUC编号映射表(md+csv双格式) |
+| 2026-04-20 | v0.5 | **DM补充SQL质量修复**：(1) DM补充行有借用模板时，改用`_fill_sql_template()`替代`_assemble_sql()`，保留参考行的JOIN条件、data_source过滤、参数控制；(2) 新增`_replace_stg_field_in_select()`替换SELECT中硬编码的stg_col_value/stg_col_name/stg_col_name_cn/check_name字段值；(3) 新增`_add_dm_supplement_comment()`为DM补充SQL添加⚠️标记注释；(4) 映射表分类从DM_SUPPLEMENT细分为DM_SUPPLEMENT_TEMPLATE(653条)和DM_SUPPLEMENT_ASSEMBLE(193条)；(5) 最终覆盖率：精确模板731(41.9%)+精确拼装2(0.1%)+DM补充模板653(37.4%)+DM补充拼装193(11.1%)+需人工167(9.6%)=1746条 |
+| 2026-04-20 | v0.6 | **URP-DM字段映射提取与工作流简化**：(1) 新增`parse_urp_dm_mapping.py`脚本从`urp_code_list/`的286个ETL脚本中提取URP报表字段↔DM指标表字段映射；(2) 生成`urp_dm_field_mapping.xlsx`，1593条映射覆盖95/98个URP表(96.9%)；(3) 映射查找优先级变更：后续报表勾稽代码查找DM表字段时**直接在xlsx中查找**，无需再解析`etl_code_list/`目录下的SQL文件；(4) 新增§10详述URP-DM映射的数据来源、字段结构、统计、示例和维护方法；(5) §3.1更新为映射查找优先级说明；(6) §5更新实现路线步骤2拆分为2a/2b/2c三步 |
+| 2026-04-21 | v0.7 | **参数控制字段展开**（重大更新）：(1) 参数控制字段需按业务参数值的笛卡尔积生成多个STG巡检脚本，新增§11详述参数展开机制；(2) 参数分为两类：**业务参数**（如CTRC_XMJLHXMFZRQSLJ、CTRC_YGH等，按值展开）和**个性化参数**（如TSIS_GXHCS、DW_ZXDJGID等，保留URP_PARAM_CONFIG查询不展开）；(3) 新增`param_config_loader.py`模块加载`code_param_list.xlsx`参数定义，区分参数类型；(4) 新增参数映射配置xlsx，从ETL清洗代码解析字段→参数的依赖关系；(5) `generate_stg_checks.py`新增参数展开逻辑：对业务参数做笛卡尔积展开，个性化参数保留子查询；(6) SUC编号方案变更：展开后的SQL按连续编号追加（SUC1747起）；(7) 映射表新增`param_codes`和`param_values`字段；(8) 预计展开后总SQL文件约2030-2100个 |
+| 2026-04-21 | v0.7.1 | **参数展开BUG修复与增强**（影响60+个SQL文件）：(1) 修复`_remove_business_param_conditions`无法处理CASE WHEN参数模式的问题——新增`_replace_case_when_params`函数，将CASE WHEN子查询块替换为当前参数值对应的THEN分支表达式；(2) 新增`_remove_inline_param_conditions`函数，处理AND/OR行内业务参数条件（包括`<>`、`IN`、`NOT IN`等比较运算符）；(3) 修复不在配置中的业务参数导致展开失败的问题——`generate_param_expanded_sqls`将无值列表的业务参数降级为个性化参数（保留URP_PARAM_CONFIG查询不展开）；(4) 修复等价参数映射（如SRDT5_YGH→CTRC_YGH）在CASE WHEN场景下的正确展开；(5) 端到端验证结果：196份展开SQL含`-- 参数组合:`注释，0份文件残存业务参数条件，116份仅含个性化参数；(6) 总SQL文件1965份，覆盖率91.5% |
+| 2026-04-21 | v0.7.2 | **param_field_mapping.xlsx数据修复 + 设计原则更新**：(1) 发现`param_field_mapping.xlsx`仅包含136条映射（仅来自巡检列`my_poor_solution.xlsx`），缺失了ETL清洗文件解析的3635条映射，导致`DM_CTRC_XTCPLXRXXZBB.XMJLHXMFZRGH`字段的`CTRC_XMJLHXMFZRQSLJ`和`CTRC_YGH`两个业务参数未生成笛卡尔积展开（仅生成1份SUC1394而非预期的10份）；(2) 根因：`parse_etl_params.py`的`main()`函数虽合并了ETL解析结果和巡检列解析结果（共2045条去重映射），但上次写入xlsx时可能因权限错误导致ETL部分未保存；(3) 修复：重新运行`parse_etl_params.py`以生成完整的2045条映射；(4) **重要设计原则**：禁止参考`my_poor_solution.xlsx`中的方案作为SQL模板来源，该文件会误导参数控制逻辑 |
+| 2026-04-21 | v0.8 | **字段级参数映射注入 + 嵌套CASE WHEN解析**（解决305.1918仅生成1份SQL的问题）：(1) `parse_etl_params.py`新增Step 3b——检测外层CASE WHEN `END AS field_alias` 的THEN表达式中嵌套的`#[PARAM]`引用，将嵌套参数也映射到同一field_alias（如`CTRC_YGH`映射到`XMJLHXMFZRGH`）；(2) 重新运行后`param_field_mapping.xlsx`从2045条扩展到2456条；(3) `generate_stg_checks.py`新增`load_field_param_mapping()`函数，从`param_field_mapping.xlsx`构建`(dm_table, dm_field) → [param_code, ...]`查找表；(4) 参数展开入口条件扩展为三种触发：SQL含URP_PARAM_CONFIG / SQL模板含#[PARAM]占位符 / **字段级映射表明该字段受业务参数控制**（即使SQL中无参数引用）；(5) `generate_param_expanded_sqls()`新增`field_param_codes`参数，支持外部传入字段级映射的参数代码进行展开；(6) 修复SQL头部`-- 参数组合:`注释无法插入的问题——改用"在`-- 检查编号:`前插入"策略，兼容含额外注释行（如DM补充⚠️注释）的SQL；(7) 验证结果：305.1918生成10份SQL（2×5笛卡尔积），总SQL文件2112份，509份含参数标注 |
+| 2026-04-21 | v0.8.1 | **参数展开正确性反思 + 新增设计原则**：(1) **发现v0.8的10份SQL虽然参数注释不同，但SQL体完全一致**——仅替换了头部注释和WHERE条件中的URP_PARAM_CONFIG，未改变JOIN链、STG表、STG字段；(2) 根因：v0.7-v0.8的参数展开逻辑假设参数只控制WHERE条件（URP_PARAM_CONFIG子查询），但实际上 **ETL参数控制的是清洗逻辑（CASE WHEN + JOIN条件），不同参数值组合产生完全不同的SQL结构**；(3) 以305.1918为例，验证了正确逻辑：CTRC_XMJLHXMFZRQSLJ控制DW表JOIN方式，CTRC_YGH控制DW→STG字段映射，WHERE必须添加URP_PARAM_CONFIG过滤限定数据范围；(4) 从DW清洗代码`DW_D_COMPANY_EMP_INFO_恒生综合管理平台.sql`提取了完整DW→STG字段血缘：`LOGIN_ALIAS←EXT_FIELD_1(登录别名)`、`EMPLOYEE_ID←USER_CODE(用户编码)`、`OUT_SYSTEM_USER_ID←OUT_SYSTEM_USER_ID(第三方系统用户ID)`；(5) 新增§9.7原则：参数组合决定SQL结构（JOIN链+STG字段+WHERE过滤），而非仅替换条件；(6) 新增§9.8原则：STG字段表达式与WHERE空值判断必须逻辑自洽——当STG字段使用`NVL(字段A,字段B)`时，WHERE空值判断也必须是`NVL(trim(字段A),trim(字段B)) IS NULL`；(7) **结论：v0.8的参数展开方案需升级为"参数驱动SQL结构重建"，需要构建并持久化完整的ETL血缘映射（DM字段→参数→{JOIN链, DW字段, STG字段}）作为SQL生成的输入配置** |
+| 2026-04-21 | v0.9 | **参数驱动SQL结构重建（v0.8.1结论的实现）**：(1) 新增`etl_lineage_config.json`血缘配置文件，结构化描述DM字段→参数→{JOIN链, DW字段表达式, STG字段}的三层映射关系；(2) 血缘配置按参数维度组织：`join_path`类参数控制DW表JOIN方式，`field_mapping`类参数控制DW→STG字段映射，笛卡尔积自然生成所有组合；(3) `generate_stg_checks.py`新增`load_etl_lineage_config()`、`rebuild_sql_with_lineage()`、`_build_stg_null_check()`等函数，支持血缘驱动的SQL结构重建；(4) 参数展开优先级变更：**血缘配置优先**——当`etl_lineage_config.json`中存在该DM字段的血缘映射时，走血缘重建路径（重建JOIN链+STG字段+WHERE过滤）；否则走v0.8原有路径（仅替换WHERE条件）；(5) 实现§9.8逻辑自洽原则：`_build_stg_null_check()`根据STG字段表达式自动生成匹配的空值判断——简单字段→`trim(field) IS NULL`，NVL组合→`NVL(trim(A),trim(B)) IS NULL`；(6) 端到端验证：305.1918生成10份SQL，3个维度全部正确区分——JOIN链（trust_mgr vs trust_mgr+B+C）、STG字段（EXT_FIELD_1/USER_CODE/OUT_SYSTEM_USER_ID/NVL组合）、WHERE空值判断与STG字段表达式逻辑自洽 |
+| 2026-04-23 | v1.0 | **数据库兼容支持 + INSERT语句生成（单代码兼容多数据库）**：(1) 重构`db_insert_generator.py`，使用统一适配器模式实现**一份代码同时支持Oracle、达梦、OceanBase**；(2) 保留`DatabaseAdapter`基类及三个实现类，但在生成时根据目标数据库类型选择对应适配器生成兼容代码；(3) 新增`ScriptConfig`类支持可配置脚本参数，配置通过`db_insert_config.json`管理；(4) 新增`SQLParser`类从巡检SQL自动提取字段信息；(5) 新增`InsertGenerator`类，将巡检SQL转换为PL/SQL块，包含幂等性检查；(6) **输出目录结构调整**：按SUC编号范围分目录（每100个文件），如`SUC0001_SUC0100/`、`SUC0101_SUC0200/`等，与SQL文件目录结构一致；(7) `generate_stg_checks.py`主流程集成数据库INSERT生成；(8) 生成的INSERT语句符合`URP_STG_DATA_CHECK_AI`表结构，包含27个字段；(9) 验证结果：2112份SQL文件，每份生成对应INSERT脚本，总计2112个INSERT文件 |
+| 2026-04-23 | v1.1 | **BR042301：STG巡检代码重复性约束**：(1) 新增`analyze_shared_dm.py`脚本，分析报表勾稽代码与DM指标的共享关系；(2) 关联`report_check_list.xlsx`和`urp_dm_field_mapping.xlsx`，识别哪些不同报表勾稽代码引用了相同的DM指标字段；(3) 对共享的DM指标，标记所有引用的勾稽代码，其中选中的生成目标标记为`S`（Share），共用的标记为`C`（Common）；(4) **选择规则**：优先以DQ开头的报表勾稽代码（定期报送）生成STG巡检代码，如果无DQ开头的则选择数字开头的，否则选择第一个；(5) 分析结果：344个共享DM指标，305个选择DQ开头的勾稽代码生成STG巡检，39个选择数字开头的，总计需要排除502个勾稽代码；(6) 修改`generate_stg_checks.py`主流程，加载`shared_dm_mapping.json`并生成排除集合，在SQL生成循环中跳过排除集合中的勾稽代码；(7) 生成的巡检脚本数量将减少，避免重复 |
+| 2026-04-23 | v1.2 | **BR042302：URP_SQLUPDATE_LOG表历史数据清理**：(1) 新增`cleanup_sqlupdate_log.sql`脚本，用于清理`URP_SQLUPDATE_LOG`表指定日期以前的历史数据；(2) 支持通过DEFINE参数传入天数（如30天），自动计算截止日期并生成删除SQL；(3) 脚本需兼容Oracle、达梦、OceanBase三种数据库；(4) 详细设计见§18 | 
